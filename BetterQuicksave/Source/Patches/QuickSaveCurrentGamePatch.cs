@@ -1,33 +1,26 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Reflection;
-using System.Reflection.Emit;
 using HarmonyLib;
-using TaleWorlds.Core;
+using TaleWorlds.CampaignSystem;
 
 namespace BetterQuicksave.Patches
 {
-    [HarmonyPatch(typeof(MBSaveLoad), "QuickSaveCurrentGame")]
+    [HarmonyPatch(typeof(SaveHandler), "QuickSaveCurrentGame")]
     public class QuickSaveCurrentGamePatch
     {
         public static event Action OnQuicksave;
-        
-        private static readonly MethodInfo OverwriteSaveFile = AccessTools.Method(typeof(MBSaveLoad), "OverwriteSaveFile");
-        private static readonly MethodInfo GetQuicksaveName =
-            SymbolExtensions.GetMethodInfo(() => QuicksaveManager.GetNextQuicksaveName());
 
-        private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        private static bool Prefix(SaveHandler __instance)
         {
-            foreach (CodeInstruction instruction in instructions)
-            {
-                if (instruction.opcode == OpCodes.Call && instruction.operand == OverwriteSaveFile)
-                {
-                    yield return new CodeInstruction(OpCodes.Pop);
-                    yield return new CodeInstruction(OpCodes.Call, GetQuicksaveName);
-                }
+            // Replace the vanilla quicksave with our custom one
+            var customSaveName = QuicksaveManager.GetNextQuicksaveName();
 
-                yield return instruction;
-            }
+            // Call SaveAs directly with our custom name instead of letting QuickSaveCurrentGame run
+            var saveAsMethod = typeof(SaveHandler).GetMethod("SaveAs", BindingFlags.Public | BindingFlags.Instance);
+            saveAsMethod?.Invoke(__instance, new object[] { customSaveName });
+
+            // Return false to prevent the original QuickSaveCurrentGame from executing
+            return false;
         }
 
         private static void Postfix()

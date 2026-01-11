@@ -1,22 +1,28 @@
 ﻿using System;
+using System.IO;
+using System.Linq;
 using System.Text.RegularExpressions;
 using BetterQuicksave.Patches;
 using SandBox;
 using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.GameState;
+using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.Core;
 using TaleWorlds.Engine;
 using TaleWorlds.Engine.Screens;
 using TaleWorlds.Library;
-using TaleWorlds.SaveSystem.Load;
 using TaleWorlds.MountAndBlade;
+using TaleWorlds.SaveSystem;
+using TaleWorlds.SaveSystem.Load;
 
 namespace BetterQuicksave
 {
     public static class QuicksaveManager
     {
         public static bool CanQuickload => Game.Current?.CurrentState == Game.State.Running && Game.Current.GameType.SupportsSaving;
-      
+
         private static readonly EventListeners eventListeners = new EventListeners();
+        private static readonly FileDriver SaveDriver = new FileDriver();
         private static int NextQuicksaveNumber { get; set; } = 1;
         private static string CurrentPlayerName
         {
@@ -27,7 +33,7 @@ namespace BetterQuicksave
             }
         }
 
-        private static LoadGameResult CurrentLoadGameResult { get; set; } = null;
+        private static LoadResult CurrentLoadGameResult { get; set; } = null;
         private static string QuicksaveNamePattern
         {
             get
@@ -57,7 +63,7 @@ namespace BetterQuicksave
         /// and to prevent duplicate listeners from accidentally being created.
         /// </summary>
         public static void Init() { }
-        
+
         public static string GetNextQuicksaveName()
         {
             if (NextQuicksaveNumber > Config.MaxQuicksaves)
@@ -65,7 +71,7 @@ namespace BetterQuicksave
                 NextQuicksaveNumber = 1;
             }
 
-            string characterName = Config.PerCharacterSaves ? $"{CurrentPlayerName} ": string.Empty;
+            string characterName = Config.PerCharacterSaves ? $"{CurrentPlayerName} " : string.Empty;
             string saveNum = Config.MultipleQuicksaves ? $"{NextQuicksaveNumber:000}" : string.Empty;
 
             return $"{characterName}{Config.QuicksavePrefix}{saveNum}";
@@ -85,7 +91,7 @@ namespace BetterQuicksave
             }
             else
             {
-                if (CurrentLoadGameResult.LoadResult.Successful)
+                if (CurrentLoadGameResult.Successful)
                 {
                     if (Mission.Current != null)
                     {
@@ -96,7 +102,7 @@ namespace BetterQuicksave
                 {
                     InformationManager.DisplayMessage(new InformationMessage("Unable to load quicksave:",
                         Colors.Yellow));
-                    foreach (LoadError loadError in CurrentLoadGameResult.LoadResult.Errors)
+                    foreach (LoadError loadError in CurrentLoadGameResult.Errors)
                     {
                         InformationManager.DisplayMessage(new InformationMessage(loadError.Message, Colors.Red));
                     }
@@ -106,18 +112,33 @@ namespace BetterQuicksave
             }
         }
 
-        private static LoadGameResult GetLatestQuicksave()
+        private static LoadResult GetLatestQuicksave()
         {
-            SaveGameFileInfo[] saveFiles = MBSaveLoad.GetSaveFiles();
-            foreach (SaveGameFileInfo saveFile in saveFiles)
+            try
             {
-                if (IsValidQuicksaveName(saveFile.Name))
-                {
-                    return MBSaveLoad.LoadSaveGameData(saveFile.Name, Utilities.GetModulesNames());
-                }
-            }
+                var saveFiles = SaveDriver.GetSaveGameFileInfos();
+                var latest = saveFiles
+                    .Where(f => IsValidQuicksaveName(f.Name))
+                    .Select(f => new
+                    {
+                        Info = f,
+                        Timestamp = File.GetLastWriteTime(FileDriver.GetSaveFilePath(f.Name).FileFullPath)
+                    })
+                    .OrderByDescending(x => x.Timestamp)
+                    .FirstOrDefault();
 
-            return null;
+                if (latest == null)
+                {
+                    return null;
+                }
+
+                return SaveManager.Load(latest.Info.Name, SaveDriver);
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage($"Failed to quickload: {ex.Message}", Colors.Red));
+                return null;
+            }
         }
 
         private static void HandleCurrentLoadGameResult()
@@ -138,26 +159,50 @@ namespace BetterQuicksave
             }
         }
 
-        private static void LoadSave(LoadGameResult lgr)
+        private static void LoadSave(LoadResult lgr)
         {
-            ScreenManager.PopScreen();
-            GameStateManager.Current.CleanStates(0);
-            GameStateManager.Current = Module.CurrentModule.GlobalGameStateManager;
-            MBGameManager.StartNewGame(new CampaignGameManager(lgr.LoadResult));
+            try
+            {
+                // Use SandBoxSaveHelper for safer load handling
+                SandBoxSaveHelper.TryLoadSave(
+                    new SaveGameFileInfo { Name = lgr.MetaData["save_name"], MetaData = lgr.MetaData },
+                    (loadResult) =>
+                    {
+                        if (!loadResult.Successful)
+                        {
+                            InformationManager.DisplayMessage(
+                                new InformationMessage("Quickload failed!", Colors.Red));
+                        }
+                    },
+                    () => { }
+                );
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(
+                    new InformationMessage($"Quickload error: {ex.Message}", Colors.Red));
+            }
         }
 
         private static void SetNextQuicksaveNumber()
         {
-            SaveGameFileInfo[] saveFiles = MBSaveLoad.GetSaveFiles();
-            foreach (SaveGameFileInfo saveFile in saveFiles)
+            try
             {
-                Match match = Regex.Match(saveFile.Name, QuicksaveNamePattern);
-                if (match.Success)
+                var saveFiles = SaveDriver.GetSaveGameFileInfos();
+                foreach (SaveGameFileInfo saveFile in saveFiles)
                 {
-                    Int32.TryParse(match.Groups[1].Value, out int num);
-                    NextQuicksaveNumber = num + 1;
-                    return;
+                    Match match = Regex.Match(saveFile.Name, QuicksaveNamePattern);
+                    if (match.Success)
+                    {
+                        Int32.TryParse(match.Groups[1].Value, out int num);
+                        NextQuicksaveNumber = num + 1;
+                        return;
+                    }
                 }
+            }
+            catch
+            {
+                // If we can't read save files, just reset to 1
             }
 
             NextQuicksaveNumber = 1;
@@ -172,8 +217,8 @@ namespace BetterQuicksave
                     HandleCurrentLoadGameResult();
                 }
             }
-            
-            private void OnPlayerCharacterChanged(Hero hero, MobileParty party)
+
+            private void OnPlayerCharacterChanged(Hero previousHero, Hero newHero, MobileParty party, bool isMainParty)
             {
                 SetNextQuicksaveNumber();
             }
